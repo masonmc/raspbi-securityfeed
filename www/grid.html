@@ -88,7 +88,8 @@
 
 <script>
   const PAGE_REFRESH_MS   = 60 * 60 * 1000; // full reload every hour
-  const REVERT_MS        = 10 * 60 * 1000; // inactivity before returning to the default view
+  const REVERT_MS         = 10 * 60 * 1000; // inactivity before returning to the default view
+  const ZOOM_REVERT_MS    =  2 * 60 * 1000; // inactivity before a clicked-to-zoom camera unzooms
   const NAV_HIDE_MS       = 3000;           // nav fades after this much mouse stillness
 
   const CAMS = {
@@ -218,23 +219,35 @@
   window.addEventListener('hashchange', applyView);
 
   // Click a tile in any multi-camera view to fill the screen with it; click the
-  // full-screen camera again to go back to the layout you came from.
-  let returnTo = null; // hash of the layout to restore ('' = default view)
+  // full-screen camera again (or leave it idle for ZOOM_REVERT_MS) to go back
+  // to the layout you came from.
+  let zoomed = null; // { id, returnTo } while a clicked-to-zoom camera is showing
+
+  function unzoom() {
+    const back = zoomed ? zoomed.returnTo : '';
+    zoomed = null;
+    if (back) location.hash = back;
+    else goToDefault();
+  }
+
   grid.addEventListener('click', (e) => {
     if (e.target.tagName !== 'VIDEO') return;
     if (grid.classList.contains('multi')) {
-      returnTo = location.hash;
+      zoomed = { id: e.target.id, returnTo: location.hash };
       location.hash = e.target.id;
+      onActivity(); // start the unzoom countdown from the click
     } else {
-      const back = returnTo;
-      returnTo = null;
-      if (back) location.hash = back;
-      else goToDefault();
+      unzoom();
     }
   });
 
+  // Navigating anywhere else (navbar, keys) ends the zoom
+  window.addEventListener('hashchange', () => {
+    if (zoomed && currentViewName() !== zoomed.id) zoomed = null;
+  });
+
   // ---------- Activity tracking ----------
-  let navTimer, revertTimer;
+  let navTimer, revertTimer, zoomTimer;
   function onActivity() {
     document.body.classList.add('active');
     document.body.classList.remove('idle');
@@ -248,6 +261,11 @@
     revertTimer = setTimeout(() => {
       if (location.hash) goToDefault();
     }, REVERT_MS);
+
+    clearTimeout(zoomTimer);
+    zoomTimer = setTimeout(() => {
+      if (zoomed && currentViewName() === zoomed.id) unzoom();
+    }, ZOOM_REVERT_MS);
   }
   ['mousemove', 'mousedown', 'keydown', 'wheel', 'touchstart'].forEach(ev =>
     window.addEventListener(ev, onActivity, { passive: true }));
