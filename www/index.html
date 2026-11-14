@@ -278,41 +278,87 @@
     if (n >= 1 && n <= ids.length) location.hash = ids[n - 1];
   });
 
-  // Hourly full reload (keeps the current view; inactivity revert still applies)
-  setTimeout(() => location.reload(), PAGE_REFRESH_MS);
+  // Hourly full reload (keeps the current view; inactivity revert still applies).
+  // go2rtc sends no cache headers, so Chromium can keep serving a stale copy of
+  // this page forever; re-fetching it with cache:'reload' first refreshes the
+  // cached copy so deploys reach the kiosk.
+  setTimeout(async () => {
+    try { await fetch(location.pathname, { cache: 'reload' }); } catch (_) {}
+    location.reload();
+  }, PAGE_REFRESH_MS);
 
   // ---------- Streams ----------
-  async function startStream(camId) {
+  // The Pi's own kiosk (opened at 127.0.0.1) can't decode the full-res main
+  // streams, so it uses each camera's low-res "<cam>_sub" go2rtc stream.
+  // Force either way on any machine with ?lite or ?full.
+  const params = new URLSearchParams(location.search);
+  const LITE = params.has('lite') ||
+    (!params.has('full') && ['127.0.0.1', 'localhost', '[::1]'].includes(location.hostname));
+  const RETRY_MS = 5000;
+
+  async function pickSources() {
+    const src = Object.fromEntries(Object.keys(CAMS).map(id => [id, id]));
+    if (!LITE) return src;
     try {
-      const pc = new RTCPeerConnection();
-      pc.ontrack = (event) => {
-        const el = document.getElementById(camId);
-        if (el && event.streams[0]) {
-          el.srcObject = event.streams[0];
-        }
-      };
-      pc.addTransceiver('video', { direction: 'recvonly' });
-
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-
-      const response = await fetch(`/api/webrtc?src=${camId}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/sdp' },
-        body: offer.sdp
-      });
-
-      if (response.ok) {
-        const answerSdp = await response.text();
-        await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
-      }
+      const known = await (await fetch('/api/streams')).json();
+      for (const id of Object.keys(CAMS)) if (known[id + '_sub']) src[id] = id + '_sub';
     } catch (err) {
-      console.error(`Failed to connect ${camId}:`, err);
+      console.error('Could not list streams; using main streams:', err);
     }
+    return src;
+  }
+
+  // Connects one camera and reconnects whenever the connection drops
+  // (e.g. go2rtc restarts or a camera reboots).
+  function startStream(camId, src) {
+    let pc, retryTimer;
+    const retry = () => {
+      if (retryTimer) return;
+      try { pc && pc.close(); } catch (_) {}
+      retryTimer = setTimeout(() => { retryTimer = null; connect(); }, RETRY_MS);
+    };
+
+    async function connect() {
+      try {
+        pc = new RTCPeerConnection();
+        pc.ontrack = (event) => {
+          const el = document.getElementById(camId);
+          if (el && event.streams[0]) el.srcObject = event.streams[0];
+        };
+        pc.onconnectionstatechange = () => {
+          const state = pc.connectionState;
+          if (state === 'failed' || state === 'closed') retry();
+          if (state === 'disconnected') {
+            // Often recovers by itself; give it a moment before reconnecting
+            const thisPc = pc;
+            setTimeout(() => { if (thisPc === pc && pc.connectionState !== 'connected') retry(); }, RETRY_MS);
+          }
+        };
+        pc.addTransceiver('video', { direction: 'recvonly' });
+
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+
+        const response = await fetch(`/api/webrtc?src=${encodeURIComponent(src)}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/sdp' },
+          body: offer.sdp
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        await pc.setRemoteDescription({ type: 'answer', sdp: await response.text() });
+      } catch (err) {
+        console.error(`Failed to connect ${camId} (${src}):`, err);
+        retry();
+      }
+    }
+
+    connect();
   }
 
   applyView();
-  Object.keys(CAMS).forEach(startStream);
+  pickSources().then(src => {
+    for (const id of Object.keys(CAMS)) startStream(id, src[id]);
+  });
 </script>
 </body>
 </html>
